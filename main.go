@@ -10,7 +10,7 @@ import (
 type QueryPart struct {
 	Type     string
 	Value    string
-	Children []QueryPart // For nested expressions
+	Children []QueryPart
 }
 
 // LabelMatcher represents a label matching expression
@@ -27,37 +27,47 @@ type VectorSelector struct {
 	Offset        string
 }
 
+// AggregationOperator represents an aggregation operation
+type AggregationOperator struct {
+	Name      string
+	Grouping  []string
+	Parameter string
+}
+
 // PromQLParser holds the parsing state and results
 type PromQLParser struct {
 	query           string
 	currentPos      int
-	parts           []QueryPart
+	parts          []QueryPart
 	vectorSelectors []VectorSelector
 }
 
-// NewParser creates a new PromQL parser instance
 func NewParser(query string) *PromQLParser {
 	return &PromQLParser{
 		query:           query,
 		currentPos:      0,
-		parts:           make([]QueryPart, 0),
+		parts:          make([]QueryPart, 0),
 		vectorSelectors: make([]VectorSelector, 0),
 	}
 }
 
-// Parse parses the complete PromQL query
 func (p *PromQLParser) Parse() ([]QueryPart, error) {
 	query := strings.TrimSpace(p.query)
 
-	// Compile all regular expressions
+	// Check for aggregation operation with leading "by" clause
+	if aggOp := p.parseAggregationWithLeadingBy(query); aggOp != nil {
+		return aggOp, nil
+	}
+
+	// Regular parsing for other cases
 	patterns := map[string]*regexp.Regexp{
-		"metric_name": regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]*`),
-		"function":    regexp.MustCompile(`^(\w+)\(`),
-		"label":       regexp.MustCompile(`{([^}]+)}`),
-		"operator":    regexp.MustCompile(`^[\+\-\*\/\%\^]=?`),
-		"number":      regexp.MustCompile(`^-?\d+(\.\d+)?`),
-		"duration":    regexp.MustCompile(`^[0-9]+[smhdwy]`),
-		"aggregation": regexp.MustCompile(`^(sum|avg|count|min|max|group)`),
+		"metric_name":  regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]*`),
+		"function":     regexp.MustCompile(`^(\w+)\(`),
+		"label":        regexp.MustCompile(`{([^}]+)}`),
+		"operator":     regexp.MustCompile(`^[\+\-\*\/\%\^]=?`),
+		"number":       regexp.MustCompile(`^-?\d+(\.\d+)?`),
+		"duration":     regexp.MustCompile(`^[0-9]+[smhdwy]`),
+		"aggregation": regexp.MustCompile(`^(sum|avg|count|min|max|group|stddev|stdvar|topk|bottomk|quantile)`),
 		"by":          regexp.MustCompile(`^by\s*\(`),
 		"without":     regexp.MustCompile(`^without\s*\(`),
 		"offset":      regexp.MustCompile(`^offset\s+[0-9]+[smhdwy]`),
@@ -74,26 +84,24 @@ func (p *PromQLParser) Parse() ([]QueryPart, error) {
 		for partType, pattern := range patterns {
 			if loc := pattern.FindStringIndex(query); loc != nil && loc[0] == 0 {
 				match := query[loc[0]:loc[1]]
-
+				
 				switch partType {
+				case "aggregation":
+					parts, remaining := p.parseAggregation(query)
+					p.parts = append(p.parts, parts...)
+					query = remaining
+					matched = true
+
 				case "metric_name":
-					// Check if it's followed by label matchers
-					if strings.HasPrefix(query[loc[1]:], "{") {
-						vs, remaining := p.parseVectorSelector(query)
-						p.vectorSelectors = append(p.vectorSelectors, vs)
-						p.parts = append(p.parts, QueryPart{
-							Type:     "vector_selector",
-							Value:    vs.MetricName,
-							Children: p.convertLabelsToQueryParts(vs.LabelMatchers),
-						})
-						query = remaining
-					} else {
-						p.parts = append(p.parts, QueryPart{
-							Type:  "metric_name",
-							Value: match,
-						})
-						query = query[loc[1]:]
-					}
+					vs, remaining := p.parseVectorSelector(query)
+					p.vectorSelectors = append(p.vectorSelectors, vs)
+					p.parts = append(p.parts, QueryPart{
+						Type:     "vector_selector",
+						Value:    vs.MetricName,
+						Children: p.convertLabelsToQueryParts(vs.LabelMatchers),
+					})
+					query = remaining
+					matched = true
 
 				case "function":
 					funcName := strings.TrimSuffix(match, "(")
@@ -104,50 +112,170 @@ func (p *PromQLParser) Parse() ([]QueryPart, error) {
 						Children: args,
 					})
 					query = remaining
-
-				case "by":
-					grouping, remaining := p.parseGrouping(query[loc[1]:])
-					p.parts = append(p.parts, QueryPart{
-						Type:     "by",
-						Value:    "by",
-						Children: grouping,
-					})
-					query = remaining
-
-				case "label":
-					labelMatchers := p.parseLabelMatchers(match)
-					p.parts = append(p.parts, QueryPart{
-						Type:     "labels",
-						Children: p.convertLabelsToQueryParts(labelMatchers),
-					})
-					query = query[loc[1]:]
+					matched = true
 
 				default:
-					p.parts = append(p.parts, QueryPart{
-						Type:  partType,
-						Value: match,
-					})
-					query = query[loc[1]:]
+					if matched = p.handleDefaultCase(partType, match, &query, loc[1]); matched {
+						break
+					}
 				}
-
-				matched = true
-				break
+				
+				if matched {
+					break
+				}
 			}
 		}
 
 		if !matched {
-			// Handle special characters and move forward
-			if query[0] == '(' || query[0] == ')' || query[0] == ',' || query[0] == '[' || query[0] == ']' {
-				p.parts = append(p.parts, QueryPart{
-					Type:  "delimiter",
-					Value: string(query[0]),
-				})
+			// Handle special characters
+			if p.handleSpecialCharacter(&query) {
+				continue
 			}
 			query = query[1:]
 		}
 	}
 
 	return p.parts, nil
+}
+
+func (p *PromQLParser) parseAggregationWithLeadingBy(query string) []QueryPart {
+	// Pattern for "(<aggOp> by (<labels>) (<expr>))"
+	pattern := regexp.MustCompile(`^(\()?\s*(sum|avg|count|min|max|group|stddev|stdvar|topk|bottomk|quantile)\s+by\s*\(([\w\s,]+)\)\s*\((.*)\)(\))?`)
+	
+	if matches := pattern.FindStringSubmatch(query); len(matches) > 0 {
+		aggOp := matches[2]
+		labels := strings.Split(matches[3], ",")
+		expr := matches[4]
+
+		// Clean up labels
+		for i := range labels {
+			labels[i] = strings.TrimSpace(labels[i])
+		}
+
+		// Parse the inner expression
+		innerParser := NewParser(expr)
+		innerParts, _ := innerParser.Parse()
+
+		return []QueryPart{
+			{
+				Type:  "aggregation_op",
+				Value: aggOp,
+				Children: []QueryPart{
+					{
+						Type:  "by",
+						Value: "by",
+						Children: func() []QueryPart {
+							parts := make([]QueryPart, len(labels))
+							for i, label := range labels {
+								parts[i] = QueryPart{
+									Type:  "group_label",
+									Value: label,
+								}
+							}
+							return parts
+						}(),
+					},
+					{
+						Type:     "expression",
+						Children: innerParts,
+					},
+				},
+			},
+		}
+	}
+
+	return nil
+}
+
+func (p *PromQLParser) parseAggregation(query string) ([]QueryPart, string) {
+	pattern := regexp.MustCompile(`^(sum|avg|count|min|max|group|stddev|stdvar|topk|bottomk|quantile)\s*`)
+	if matches := pattern.FindStringSubmatch(query); len(matches) > 0 {
+		aggOp := matches[1]
+		remaining := query[len(matches[0]):]
+
+		// Parse the rest of the aggregation expression
+		var children []QueryPart
+		var byClause []QueryPart
+
+		// Check for by/without clause before the main expression
+		if strings.HasPrefix(remaining, "by") || strings.HasPrefix(remaining, "without") {
+			byClause, remaining = p.parseGrouping(remaining)
+		}
+
+		// Parse the main expression
+		if strings.HasPrefix(remaining, "(") {
+			exprParts, newRemaining := p.parseFunctionArgs(remaining)
+			children = append(children, QueryPart{
+				Type:     "expression",
+				Children: exprParts,
+			})
+			remaining = newRemaining
+		}
+
+		if len(byClause) > 0 {
+			children = append([]QueryPart{{
+				Type:     "by",
+				Children: byClause,
+			}}, children...)
+		}
+
+		return []QueryPart{{
+			Type:     "aggregation",
+			Value:    aggOp,
+			Children: children,
+		}}, remaining
+	}
+
+	return nil, query
+}
+
+// handleDefaultCase handles the default case in the main parsing switch
+func (p *PromQLParser) handleDefaultCase(partType, match string, query *string, loc int) bool {
+	switch partType {
+	case "by", "without":
+		grouping, remaining := p.parseGrouping((*query)[loc:])
+		p.parts = append(p.parts, QueryPart{
+			Type:     partType,
+			Children: grouping,
+		})
+		*query = remaining
+		return true
+		
+	case "label":
+		labelMatchers := p.parseLabelMatchers(match)
+		p.parts = append(p.parts, QueryPart{
+			Type:     "labels",
+			Children: p.convertLabelsToQueryParts(labelMatchers),
+		})
+		*query = (*query)[loc:]
+		return true
+
+	case "operator", "number", "duration", "bool":
+		p.parts = append(p.parts, QueryPart{
+			Type:  partType,
+			Value: match,
+		})
+		*query = (*query)[loc:]
+		return true
+	}
+	
+	return false
+}
+
+// handleSpecialCharacter handles special characters in the query
+func (p *PromQLParser) handleSpecialCharacter(query *string) bool {
+	if len(*query) > 0 {
+		char := (*query)[0]
+		if char == '(' || char == ')' || char == ',' || char == '[' || char == ']' {
+			p.parts = append(p.parts, QueryPart{
+				Type:  "delimiter",
+				Value: string(char),
+			})
+			*query = (*query)[1:]
+			return true
+		}
+	}
+	return false
 }
 
 // parseVectorSelector parses a metric name and its label matchers
